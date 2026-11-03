@@ -111,6 +111,79 @@ jobs:
             echo "kernel has ALIGN_DOWN, skip"
           fi
 
+      - name: Fix KernelSU-Next argv/path reads in manual hooks (second_stage detection)
+        working-directory: kernel
+        run: |
+          # Manual hooks run inside the calling task's own syscall (execve / faccessat /
+          # stat), where page faults are fine. KernelSU still reads the user strings with
+          # strncpy_from_user_nofault(), which fails if the page holding the string isn't
+          # resident yet. init's "second_stage" argument is a string literal in a page
+          # the process never touched, so the read fails, "second_stage executed" is
+          # never detected, KernelSU's SELinux rules / ksu_cred are never set up and the
+          # manager is never recognised ("exec zygote ... second_stage: 0").
+          # Use a faulting read (same return convention) for manual-hook builds only;
+          # kprobe builds run these in atomic context and keep the _nofault version.
+          set -e
+          K=KernelSU-Next/kernel
+
+          patch_file() {
+            f="$1"; shift
+            if grep -q "KSU_FAULTABLE_STRNCPY" "$f"; then
+              echo "already patched: $f"; return 0
+            fi
+            python3 - "$f" "$@" <<'EOF'
+          import sys, re
+          p, olds = sys.argv[1], sys.argv[2:]
+          s = open(p).read()
+          for old in olds:
+              assert s.count(old) == 1, f'{p}: not found exactly once: {old}'
+              s = s.replace(old, old.replace('strncpy_from_user_nofault(', 'ksu_strncpy_user_faultable('))
+          helper = r'''
+          /* KSU_FAULTABLE_STRNCPY: see fix_argv_fault.sh */
+          #ifndef KSU_KPROBES_HOOK
+          static inline long ksu_strncpy_user_faultable(char *dst,
+          		const void __user *src, long count)
+          {
+          	long ret;
+
+          	if (unlikely(count <= 0))
+          		return 0;
+          	ret = strncpy_from_user(dst, src, count);
+          	if (ret >= count) {
+          		ret = count;
+          		dst[ret - 1] = '\0';
+          	} else if (ret >= 0) {
+          		ret++;	/* include the NUL, like strncpy_from_user_nofault() */
+          	}
+          	return ret;
+          }
+          #else
+          #define ksu_strncpy_user_faultable strncpy_from_user_nofault
+          #endif
+          '''
+          last = list(re.finditer(r'^#include[^\n]*\n', s, re.M))[-1]
+          s = s[:last.end()] + helper + s[last.end():]
+          open(p, 'w').write(s)
+          EOF
+            echo "patched: $f"
+          }
+
+          patch_file $K/runtime/ksud_integration.c \
+            "	if (strncpy_from_user_nofault(buf, p, buf_len) <= 0)" \
+            "					if (strncpy_from_user_nofault(env, p, sizeof(env)) < 0)"
+
+          patch_file $K/feature/sucompat.c \
+            "	memset(path, 0, sizeof(path));
+          	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+
+          	if (unlikely(!memcmp(path, su, sizeof(su)))) {
+          		ksu_compat_sulog('a');" \
+            "	memset(path, 0, sizeof(path));
+          	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+
+          	if (unlikely(!memcmp(path, su, sizeof(su)))) {
+          		ksu_compat_sulog('s');"
+
       - name: Fix SELinux AVC seqno for kernels without selinux_state (4.9)
         working-directory: kernel
         run: |
