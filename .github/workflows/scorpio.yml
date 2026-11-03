@@ -1,0 +1,414 @@
+name: scorpio KernelSU-Next
+
+on:
+  workflow_dispatch:
+
+env:
+  # Mi Note 2 (scorpio), Evolution X 10.6 / Android 15 (vic)。
+  # 官方内核仓库 vic 分支（4.4.302，最后提交 2025-05-06，早于 10.6 发布的 2025-05-10）
+  KERNEL_REPO: https://github.com/Evolution-X-Devices/kernel_xiaomi_msm8996
+  KERNEL_BRANCH: vic
+  # 与设备树 BoardConfig 一致：通用 defconfig + 机型片段
+  DEFCONFIG: vendor/xiaomi/mi8996_defconfig vendor/xiaomi/scorpio.config
+  DEVICE: scorpio
+  KSU_BRANCH: legacy
+  # 内核对外报告的 UAPI 版本，需与管理器一致（管理器首页“管理器版本”括号里横线后的数字）。
+  # legacy 最新代码是 6，已发布的管理器 v3.4.2 是 5；6 相对 5 只是新增接口，
+  # 所以改报 5 即可让 v3.4.2 管理器完整工作。官方发布 UAPI 6 的管理器后改成 "6"。
+  KSU_UAPI: "5"   # 正式版管理器 v3.4.2 = 5；换 CI 版管理器 (UAPI 6) 时改成 "6"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential curl flex git \
+            libelf-dev libssl-dev lz4 python3 zip cpio device-tree-compiler
+
+      - name: Kernel source
+        run: |
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          head -4 kernel/Makefile
+
+      - name: Toolchain
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/tc
+          echo "$HOME/tc/bin" >> $GITHUB_PATH
+
+      - name: Integrate KernelSU-Next
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s $KSU_BRANCH
+          # 让内核报告的 UAPI 版本与管理器一致（只在当前值为 6 时修改，代码变了会报错提醒）
+          H=KernelSU-Next/uapi/supercall.h
+          grep -E "^#define KERNEL_SU_UAPI_VERSION [0-9]+$" $H
+          if [ "$KSU_UAPI" != "$(grep -oE "^#define KERNEL_SU_UAPI_VERSION [0-9]+$" $H | grep -oE "[0-9]+$")" ]; then
+            grep -q "^#define KERNEL_SU_UAPI_VERSION 6$" $H
+            sed -i "s/^#define KERNEL_SU_UAPI_VERSION 6$/#define KERNEL_SU_UAPI_VERSION $KSU_UAPI/" $H
+          fi
+          grep -E "^#define KERNEL_SU_UAPI_VERSION $KSU_UAPI$" $H
+
+      - name: Fix KernelSU-Next for old kernel_read API (<= 4.13)
+        working-directory: kernel
+        run: |
+          # 4.9 的 kernel_read 参数顺序是 (file, offset, buf, count)，
+          # KernelSU-Next legacy 多处直接按 4.14+ 的 (file, buf, count, pos) 调用，
+          # 导致读 APK 签名 / packages.list / allowlist 全部失败 -> 管理器检测不到 root。
+          # 改为调用 KernelSU 自带的兼容函数。4.14+ 内核自动跳过。
+          if grep -q "ssize_t kernel_read" fs/read_write.c; then
+            echo "new kernel_read API, skip"; exit 0
+          fi
+          cd KernelSU-Next/kernel
+          files=$(grep -rlE '(^|[^_[:alnum:]])kernel_(read|write)\(' --include=*.c . | grep -v 'compat/kernel_compat\.c' || true)
+          for f in $files; do
+            sed -i -E 's/(^|[^_[:alnum:]])kernel_read\(/\1ksu_kernel_read_compat(/g; s/(^|[^_[:alnum:]])kernel_write\(/\1ksu_kernel_write_compat(/g' "$f"
+            grep -q 'compat/kernel_compat.h' "$f" || sed -i '0,/^#include/s//#include "compat\/kernel_compat.h"\n#include/' "$f"
+            echo "patched: $f"
+          done
+
+      - name: Fix KernelSU-Next for old kernel APIs (copy_to_iter, ALIGN_DOWN)
+        working-directory: kernel
+        run: |
+          # KernelSU-Next legacy uses a few kernel APIs that changed after 4.4.
+          # Each fix only applies when the kernel has the old form; newer kernels skip.
+          set -e
+          K=KernelSU-Next/kernel
+
+          # 1) copy_to_iter(void *addr, ...) without const (e.g. 4.4):
+          #    passing the const init.rc string -> -Werror discards qualifiers
+          F=$K/runtime/ksud_integration.c
+          if grep -q "^size_t copy_to_iter(void \*addr" include/linux/uio.h; then
+            if ! grep -q "copy_to_iter((void \*)(KERNEL_SU_RC + ksu_rc_pos)" "$F"; then
+              grep -q "copy_to_iter(KERNEL_SU_RC + ksu_rc_pos," "$F" || { echo "$F: copy_to_iter call not found"; exit 1; }
+              sed -i 's/copy_to_iter(KERNEL_SU_RC + ksu_rc_pos,/copy_to_iter((void *)(KERNEL_SU_RC + ksu_rc_pos),/' "$F"
+              echo "patched copy_to_iter: $F"
+            fi
+          else
+            echo "copy_to_iter takes const, skip"
+          fi
+
+          # 2) ALIGN_DOWN() only exists since 4.15
+          if ! grep -rq "define ALIGN_DOWN" include/linux/kernel.h include/linux/align.h 2>/dev/null; then
+            for f in $(grep -rl "ALIGN_DOWN(" $K --include=*.c); do
+              grep -q "KSU_COMPAT_ALIGN_DOWN" "$f" && continue
+              # insert after the last #include of the file
+              python3 - "$f" <<'EOF'
+          import sys, re
+          p = sys.argv[1]
+          s = open(p).read()
+          last = list(re.finditer(r'^#include[^\n]*\n', s, re.M))[-1]
+          add = ('\n#ifndef ALIGN_DOWN /* KSU_COMPAT_ALIGN_DOWN: added in 4.15 */\n'
+                 '#define ALIGN_DOWN(x, a) __ALIGN_KERNEL((x) - ((a) - 1), (a))\n'
+                 '#endif\n')
+          s = s[:last.end()] + add + s[last.end():]
+          open(p, 'w').write(s)
+          EOF
+              echo "patched ALIGN_DOWN: $f"
+            done
+          else
+            echo "kernel has ALIGN_DOWN, skip"
+          fi
+
+      - name: Fix SELinux AVC seqno for kernels without selinux_state (4.9)
+        working-directory: kernel
+        run: |
+          # KernelSU-Next on kernels without selinux_state (4.9): after editing the policy
+          # in place it flushed the AVC with its own local seqno (2, 3, ...) while the
+          # security server kept handing out latest_granting = 1. From then on every
+          # avc_insert() is rejected ("SELinux: avc: seqno 1 < latest_notif 2"), the AVC
+          # never caches anything and the log floods. Bump the real latest_granting instead.
+          set -e
+          RULES=KernelSU-Next/kernel/selinux/rules.c
+          SS=security/selinux/ss/services.c
+
+          if ! grep -q "^static u32 latest_granting;$" "$SS"; then
+            echo "kernel has selinux_state (>= 4.14 style), KernelSU uses its seqno, skip"; exit 0
+          fi
+          if ! grep -q "static u32 ksu_avc_seqno = 1;" "$RULES"; then
+            grep -q "ksu_selinux_next_seqno" "$RULES" && { echo "already patched"; exit 0; }
+            echo "rules.c: KernelSU code changed, please re-check this fix"; exit 1
+          fi
+          grep -q "^static DEFINE_RWLOCK(policy_rwlock);$\|^DEFINE_RWLOCK(policy_rwlock);$" "$SS" || { echo "services.c: policy_rwlock not found"; exit 1; }
+
+          if ! grep -q "ksu_selinux_next_seqno" "$SS"; then
+            python3 - "$SS" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          helper = '''static u32 latest_granting;
+
+          #ifdef CONFIG_KSU
+          /* KernelSU-Next: hand out a real policy seqno after in-place policy edits */
+          u32 ksu_selinux_next_seqno(void)
+          {
+          	u32 seqno;
+
+          	write_lock_irq(&policy_rwlock);
+          	seqno = ++latest_granting;
+          	write_unlock_irq(&policy_rwlock);
+          	return seqno;
+          }
+          #endif
+          '''
+          s = s.replace('static u32 latest_granting;\n', helper, 1)
+          open(p, 'w').write(s)
+          EOF
+            echo "patched: $SS"
+          fi
+
+          python3 - "$RULES" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = '''	static u32 ksu_avc_seqno = 1;
+          	u32 seqno = ++ksu_avc_seqno;'''
+          new = '''	extern u32 ksu_selinux_next_seqno(void);
+          	u32 seqno = ksu_selinux_next_seqno();'''
+          assert s.count(old) == 1, 'rules.c: local seqno block not found'
+          open(p, 'w').write(s.replace(old, new))
+          EOF
+          echo "patched: $RULES"
+
+      - name: Fix fscrypt keyring for ksu_cred (< 4.10)
+        working-directory: kernel
+        run: |
+          # Kernels < 4.10 (fscrypt v1): file keys are looked up in the *current* cred's
+          # keyrings. KernelSU scans /data/app with override_creds(ksu_cred), and ksu_cred
+          # was prepared before init created its session keyring, so opening an APK whose
+          # key isn't cached yet fails ("open .../base.apk error." -> is_manager: 0).
+          # KernelSU already captures init's session keyring; also hand it to ksu_cred.
+          set -e
+          LSM=KernelSU-Next/kernel/hook/lsm_hooks.c
+          APK=KernelSU-Next/kernel/manager/apk_sign.c
+
+          if grep -q "ksu_cred->session_keyring" "$LSM"; then
+            echo "already patched"
+          else
+            python3 - "$LSM" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = '''	init_session_keyring = cred->session_keyring;
+          	pr_info("kernel_compat: got init_session_keyring\\n");'''
+          new = '''	init_session_keyring = cred->session_keyring;
+          	pr_info("kernel_compat: got init_session_keyring\\n");
+          	{
+          		/* let override_creds(ksu_cred) find fscrypt keys (fscrypt v1) */
+          		extern struct cred *ksu_cred;
+          		if (init_session_keyring && ksu_cred &&
+          		    !rcu_access_pointer(ksu_cred->session_keyring)) {
+          			rcu_assign_pointer(ksu_cred->session_keyring,
+          					   key_get(init_session_keyring));
+          			pr_info("kernel_compat: installed init session keyring to ksu_cred\\n");
+          		}
+          	}'''
+          assert s.count(old) == 1, 'lsm_hooks.c: init_session_keyring capture not found'
+          s = s.replace(old, new)
+          if '#include <linux/key.h>' not in s:
+              s = s.replace('#include <linux/lsm_hooks.h>\n', '#include <linux/lsm_hooks.h>\n#include <linux/key.h>\n#include <linux/cred.h>\n', 1)
+          open(p, 'w').write(s)
+          EOF
+            echo "patched: $LSM"
+          fi
+
+          # print the errno when an APK can't be opened
+          if grep -q 'pr_err("open %s error.\\n", path);' "$APK"; then
+            sed -i 's|pr_err("open %s error.\\n", path);|pr_err("open %s error: %ld\\n", path, PTR_ERR(fp));|' "$APK"
+            echo "patched: $APK"
+          fi
+
+      - name: Apply KernelSU-Next manual hooks
+        # 4.14 内核不支持 kprobes hook (需 >=5.10) 和 syscall table hook (需 >=4.17)，
+        # 只能用手动 hook。脚本同时兼容 4.9 / 4.14，对不上会报错并指出文件。
+        working-directory: kernel
+        shell: python3 {0}
+        run: |
+          #!/usr/bin/env python3
+          # KernelSU-Next manual hooks for non-GKI kernels (tested on 4.9 and 4.14).
+          # Run from the kernel source root. Already-hooked files are skipped.
+          import re, sys
+
+          G = '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+          E = '#endif\n'
+          failed = []
+
+          def body_span(s, header_re):
+              m = re.search(header_re, s, re.M)
+              if not m:
+                  return None
+              start = s.index('{', m.end() - 1) + 1
+              return m.start(), start
+
+          def hook(path, header_re, decl, after_re, call, init_fix=None, marker='ksu_handle_'):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  failed.append(f'{path}: file not found'); return
+              if marker in s:
+                  print(f'[skip] {path}: already hooked'); return
+              span = body_span(s, header_re)
+              if not span:
+                  failed.append(f'{path}: function not found ({header_re})'); return
+              fstart, bstart = span
+              body = s[bstart:bstart + 3000]
+              post = ''
+              if init_fix:
+                  # split "type var = expr;" into "type var;" + hook + "var = expr;"
+                  m = re.search(init_fix, body, re.M)
+                  if m:
+                      body = body[:m.start()] + m.group('decl') + ';\n' + body[m.end():]
+                      post = '\t' + m.group('var') + ' = ' + m.group('expr') + ';\n'
+                  # else: older kernels (e.g. 4.4 input.c) already declare the variable
+                  # and assign it in a separate statement after the declarations, so
+                  # inserting right after the declarations is still before its first use
+              m = re.search(after_re, body, re.M)
+              if not m:
+                  failed.append(f'{path}: insertion point not found ({after_re})'); return
+              body = body[:m.end()] + '\n' + G + call + E + post + body[m.end():]
+              s = s[:fstart] + G + decl + E + '\n' + s[fstart:bstart] + body + s[bstart + 3000:]
+              open(path, 'w').write(s)
+              print(f'[ok]   {path}')
+
+          # Last local declaration line before the first statement
+          LAST_DECL = r'^\t[^\n]*;\n(?=\n)'
+
+          hook('kernel/reboot.c',
+               r'^SYSCALL_DEFINE4\(reboot,[^{]*\{',
+               'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,\n\t\t\t\t void __user **arg);\n',
+               LAST_DECL,
+               '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n')
+
+          hook('fs/exec.c',
+               r'^static int do_execveat_common\(int fd, struct filename \*filename,[^{]*\{',
+               'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\t       void *argv, void *envp, int *flags);\n',
+               LAST_DECL,
+               '\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n')
+
+          hook('fs/open.c',
+               r'^(SYSCALL_DEFINE3\(faccessat, int, dfd|long do_faccessat\(int dfd)[^{]*\{',
+               'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *mode, int *flags);\n',
+               LAST_DECL,
+               '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n')
+
+          # 4.11+: vfs_statx(dfd, filename, flags, ...); older: vfs_fstatat(dfd, filename, stat, flag)
+          _s = open('fs/stat.c').read()
+          if re.search(r'^int vfs_statx\(int dfd, const char __user \*filename, int flags,', _s, re.M):
+              hook('fs/stat.c',
+                   r'^int vfs_statx\(int dfd, const char __user \*filename, int flags,[^{]*\{',
+                   'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
+                   LAST_DECL,
+                   '\tksu_handle_stat(&dfd, &filename, &flags);\n')
+          else:
+              hook('fs/stat.c',
+                   r'^int vfs_fstatat\(int dfd, const char __user \*filename,[^{]*\{',
+                   'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
+                   LAST_DECL,
+                   '\tksu_handle_stat(&dfd, &filename, &flag);\n')
+
+          hook('fs/read_write.c',
+               r'^SYSCALL_DEFINE3\(read, unsigned int, fd,[^{]*\{',
+               'extern void ksu_handle_sys_read(unsigned int fd);\n',
+               LAST_DECL,
+               '\tksu_handle_sys_read(fd);\n',
+               init_fix=r'^(?P<decl>\tstruct fd (?P<var>f)) = (?P<expr>fdget_pos\(fd\));\n')
+
+          hook('drivers/input/input.c',
+               r'^static void input_handle_event\(struct input_dev \*dev,[^{]*\{',
+               'extern int ksu_handle_input_handle_event(unsigned int *type,\n\t\t\t\t\t unsigned int *code, int *value);\n',
+               LAST_DECL,
+               '\tksu_handle_input_handle_event(&type, &code, &value);\n',
+               init_fix=r'^(?P<decl>\tint (?P<var>disposition)) = (?P<expr>input_get_disposition\(dev, type, code, &value\));\n')
+
+          hook('security/selinux/avc.c',
+               r'^noinline int slow_avc_audit\([^{]*\{',
+               'extern int ksu_handle_slow_avc_audit(u32 *tsid);\n',
+               LAST_DECL,
+               '\tksu_handle_slow_avc_audit(&tsid);\n')
+
+          # nosuid /data: 4.9 (and 4.14 without nosuid_transition) only allows exec domain
+          # transitions to bounded types, so init can't start /data/adb/ksud as u:r:ksu:s0
+          # ("security_bounded_transition seresult=denied ... newcontext=u:r:ksu:s0").
+          hook('security/selinux/hooks.c',
+               r'^static int check_nnp_nosuid\(const struct linux_binprm \*bprm,[^{]*\{',
+               'extern bool is_ksu_transition(const struct task_security_struct *old_tsec,\n\t\t\t      const struct task_security_struct *new_tsec);\n',
+               r'^\t\treturn 0; /\* No change in credentials \*/\n',
+               '\tif (is_ksu_transition(old_tsec, new_tsec))\n\t\treturn 0;\n',
+               marker='is_ksu_transition')
+
+          if failed:
+              print('\n[FAIL] could not apply hooks:\n  ' + '\n  '.join(failed))
+              sys.exit(1)
+
+      - name: KSU config fragment
+        working-directory: kernel
+        run: |
+          # 4.4 只能用手动 hook，显式指定（以防 defconfig 以后开了 KPROBES）。
+          # LOG_BUF_SHIFT=20: 内核日志缓冲区 1MB，方便排查。
+          printf '%s\n' \
+            CONFIG_KSU=y \
+            CONFIG_KSU_MANUAL_HOOK=y \
+            CONFIG_LOG_BUF_SHIFT=20 \
+            > arch/arm64/configs/ksu.config
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          # 此 defconfig 关闭了 LOCALVERSION_AUTO，版本号为 4.4.302-perf+（与官方编译方式相同）
+          ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make $ARGS $DEFCONFIG ksu.config
+          grep -E "CONFIG_KSU|CONFIG_LOG_BUF_SHIFT" out/.config
+          grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config
+          make $ARGS -j$(nproc --all) 2>&1 | tee ../build.log
+          grep -q "Hook mode: Manual" ../build.log
+          test -f out/arch/arm64/boot/Image.gz-dtb
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
+          # 原厂内核就是 Image.gz-dtb（内核 + dtb 拼在一起）
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb ak3/
+
+          cat > ak3/anykernel.sh << 'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=scorpio KernelSU-Next
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=scorpio
+          device.name2=
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+          sed -i 's/^          //' ak3/anykernel.sh
+
+          cd ak3 && zip -r9 ../scorpio-KernelSU-Next-$(date +%Y%m%d).zip *
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorpio-ksun
+          path: |
+            scorpio-KernelSU-Next-*.zip
+            build.log
+            kernel/out/.config
